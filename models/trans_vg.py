@@ -29,7 +29,8 @@ class TransVG(nn.Module):
 
         self.vl_transformer = build_vl_transformer(args)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-
+        self.text_weight = MLP(self.textmodel.num_channels, hidden_dim, self.visumodel.num_channels, 3)
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, img_data, text_data):
         bs = img_data.tensors.shape[0]
@@ -42,6 +43,20 @@ class TransVG(nn.Module):
         text_fea = self.textmodel(text_data)
         text_src, text_mask = text_fea.decompose()
         assert text_mask is not None
+        # text weight, which is used to caculate weighted visual embedding
+        text_weight = self.text_weight(text_src) # B*L*C
+        text_weight = text_weight.permute(0, 2, 1) # B*C*L
+        # add mask to text weight
+        # weight_mask B*L
+        weight_mask = text_mask.flatten(1)
+        weight_mask = weight_mask.unsqueeze(1)
+        # weight_mask = weight_mask.repeat(1, text_weight.size[2], 1) # B*C*L
+        text_weight.masked_fill_(weight_mask, -1e9)
+
+        text_weight = F.max_pool1d(text_weight, text_weight.size(2)) # B*C*1
+        text_weight = text_weight.squeeze(2) # B*C
+        text_weight = self.softmax(text_weight) # B*C
+
         text_src = self.text_proj(text_src)
         # permute BxLenxC to LenxBxC
         text_src = text_src.permute(1, 0, 2)
@@ -51,6 +66,8 @@ class TransVG(nn.Module):
         tgt_src = self.reg_token.weight.unsqueeze(1).repeat(1, bs, 1)
         tgt_mask = torch.zeros((bs, 1)).to(tgt_src.device).to(torch.bool)
         
+        # weighted visual embedding
+        visu_src = visu_src * text_weight.unsqueeze(0) # N*B*C
         vl_src = torch.cat([tgt_src, text_src, visu_src], dim=0)
         vl_mask = torch.cat([tgt_mask, text_mask, visu_mask], dim=1)
         vl_pos = self.vl_pos_embed.weight.unsqueeze(1).repeat(1, bs, 1)
